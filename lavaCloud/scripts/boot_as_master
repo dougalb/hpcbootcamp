@@ -1,0 +1,133 @@
+#!/bin/bash
+# Copyright 2013 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# A copy of the License is located at
+
+#  http://aws.amazon.com/apache2.0
+
+# or in the "license" file accompanying this file. This file is distributed
+# on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+# express or implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+set -x
+
+function error_exit () {
+  script=`basename $0`
+  echo "lavacloud: $script - $1"
+  logger -t lavacloud "$script - $1" 
+  exit 1
+}
+
+myhostname=$(hostname -s)
+if [ $? != 0 ]; then
+  error_exit 'Failed to determine local hostname'
+fi
+
+# Enable PAT
+RC=0
+/usr/local/sbin/configure-pat.sh || RC=1
+echo -e "\n# Enable PAT\n/usr/local/sbin/configure-pat.sh\n\n" >> /etc/rc.local || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to enable NAT(PAT)"
+fi
+
+# Set MOTD
+RC=0
+cd /etc || RC=1
+/bin/cp -f motd.MASTER motd || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to update /etc/motd"
+fi
+
+# Setup NFS as Master
+# 1. Determine subnet for NFS exports
+ETH0_MAC=`/sbin/ifconfig  | /bin/grep eth0 | awk '{print tolower($5)}' | grep '^[0-9a-f]\{2\}\(:[0-9a-f]\{2\}\)\{5\}$'`
+VPC_CIDR_URI="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH0_MAC}/vpc-ipv4-cidr-block"
+VPC_CIDR_RANGE=`curl --retry 3 --retry-delay 0 --silent --fail ${VPC_CIDR_URI}`
+if [ $? -ne 0 ] ; then
+   echo "Unable to retrive VPC CIDR range from meta-data. This either means a) non-VPC or b) an error" | logger -t "lavacloud"
+   VPC_CIDR_RANGE="10.0.0.0/8"
+else
+   echo "Retrived the VPC CIDR range: ${VPC_CIDR_RANGE} from meta-data for NFS export." | logger -t "lavacloud"
+fi
+# 2. Update config
+RC=0
+cd /etc || RC=1
+/bin/cp -f exports.MASTER exports || RC=1
+sed -i "s?<cidr>?$VPC_CIDR_RANGE?" exports || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to configure NFS exports"
+fi
+# 3. Start NFS
+RC=0
+chkconfig nfs on || RC=1
+chkconfig rpcbind on || RC=1
+chkconfig rpcidmapd on || RC=1
+service rpcbind restart || RC=1
+service rpcidmapd restart || RC=1
+service nfs restart || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to start NFS server"
+fi
+
+# Setup openlav config as Master
+RC=0
+cd /opt/openlava-2.1/etc || RC=1
+/bin/cp -f lsf.conf.MASTER lsf.conf || RC=1
+/bin/cp -f lsf.cluster.openlava.MASTER lsf.cluster.openlava || RC=1
+/bin/cp -f lsb.hosts.MASTER lsb.hosts || RC=1
+sed -i "s/<master>/$myhostname/" lsf.cluster.openlava || RC=1
+sed -i "s/<master>/$myhostname/" lsb.hosts || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to configure Openlava"
+fi
+
+# Setup Ganglia as Master
+RC=0
+location=`curl --retry 3 --retry-delay 0 --silent --fail http://169.254.169.254/latest/meta-data/placement/availability-zone` || RC=1
+cd /etc/ganglia || RC=1
+/bin/cp -f gmond.conf.MASTER gmond.conf || RC=1
+sed -i "s/<master>/$myhostname/" gmond.conf || RC=1
+sed -i "s/<location>/$location/" gmond.conf || RC=1
+cd /etc/httpd/conf.d/ || RC=1
+/bin/cp -f ganglia.conf.MASTER ganglia.conf || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to configure Ganglia"
+fi
+
+# Start httpd and ganglia services
+RC=0
+chkconfig gmond on || RC=1
+chkconfig gmetad on  || RC=1
+chkconfig httpd on || RC=1
+service gmond start || RC=1
+service gmetad start || RC=1
+service httpd start || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to start Ganglia"
+fi
+
+# Start VNC server for ec2user 
+RC=0
+cd /etc/sysconfig || RC=1
+/bin/cp -f tvncservers.MASTER tvncservers || RC=1
+chkconfig tvncserver on || RC=1
+service tvncserver start || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to setup TurboVNC"
+fi
+
+# Start openlava
+RC=0
+chkconfig openlava on || RC=1
+service openlava start || RC=1
+if [ $RC -ne 0 ]; then
+  error_exit "Failed to start Openlava"
+fi
+
+script=`basename $0`
+echo "lavacloud: $script - SUCCESS - Booted as lavaCloud Master"
+logger -t lavacloud "$script - SUCCESS - Booted as lavaCloud Master"
